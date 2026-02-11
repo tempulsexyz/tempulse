@@ -1,9 +1,10 @@
 [package]
-name = "core"
+name = "fin"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 alloy = "1.6.3"
 eyre = "0.6.12"
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", version = "1.1.2" }
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
