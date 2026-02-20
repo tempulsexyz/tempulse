@@ -41,12 +41,12 @@ pub async fn get_token(pool: &PgPool, address: &str) -> Result<Option<Token>, sq
         .await
 }
 
-/// Get the set of all tracked token addresses.
-pub async fn get_token_addresses(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT address FROM tokens")
-        .fetch_all(pool)
+/// Get the count of tracked tokens (no allocation — just a scalar).
+pub async fn get_token_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tokens")
+        .fetch_one(pool)
         .await?;
-    Ok(rows.into_iter().map(|r| r.0).collect())
+    Ok(row.0)
 }
 
 /// Update total supply for a token.

@@ -5,9 +5,13 @@
 //! 2. Discover existing tokens via TIP20Factory TokenCreated events
 //! 3. Poll blocks in batches, decode Transfer/Mint/Burn events
 //! 4. Persist to DB and update account balances
+//!
+//! Optimization: Instead of loading all tracked token addresses into memory
+//! (which fails at scale), we use the TIP-20 address prefix to identify
+//! valid tokens at O(1) cost per log, then lazily register unknown tokens via DB.
 
 use alloy::{
-    primitives::{address, Address},
+    primitives::{Address, address},
     providers::Provider,
     rpc::types::Filter,
     sol_types::SolEvent,
@@ -23,6 +27,19 @@ const FACTORY_ADDRESS: Address = address!("20Fc000000000000000000000000000000000
 /// Address zero — used in mint/burn detection.
 const ZERO_ADDRESS: Address = Address::ZERO;
 
+/// The 12-byte prefix shared by ALL TIP-20 token addresses.
+/// Any address starting with this prefix is a TIP-20 token.
+const TIP20_PREFIX: [u8; 12] = [
+    0x20, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Check if an address is a valid TIP-20 token by its prefix.
+/// This is an O(1) check that requires zero memory — no need to load token lists.
+#[inline]
+fn is_tip20_address(addr: &Address) -> bool {
+    addr.as_slice()[..12] == TIP20_PREFIX
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // ── Initialisation ──────────────────────────────────────────────────
@@ -36,9 +53,7 @@ async fn main() -> Result<()> {
     tracing::info!("Connected to database");
 
     // Run migrations
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await?;
+    sqlx::migrate!("../../migrations").run(&pool).await?;
     tracing::info!("Database migrations applied");
 
     // Create Tempo RPC provider
@@ -46,12 +61,13 @@ async fn main() -> Result<()> {
     tracing::info!("Connected to Tempo RPC");
 
     // ── Token Discovery ─────────────────────────────────────────────────
-    // Fetch all TokenCreated events from the Factory to discover existing tokens.
+    // Fetch all TokenCreated events from the Factory to seed the token registry.
+    // This only scans Factory events (one contract), so it's lightweight.
     tracing::info!("Discovering TIP-20 tokens from Factory…");
     discover_tokens(&provider, &pool, &settings).await?;
 
-    let token_addresses = storage::repos::get_token_addresses(&pool).await?;
-    tracing::info!(count = token_addresses.len(), "Tracking tokens");
+    let token_count = storage::repos::get_token_count(&pool).await?;
+    tracing::info!(count = token_count, "Tracking tokens");
 
     // ── Main Indexing Loop ──────────────────────────────────────────────
     let mut last_block = storage::repos::get_last_indexed_block(&pool).await?;
@@ -93,6 +109,9 @@ async fn main() -> Result<()> {
 }
 
 /// Discover tokens by querying TIP20Factory TokenCreated events.
+///
+/// This is safe at scale because it only queries ONE contract address
+/// (the Factory), not all tokens.
 async fn discover_tokens(
     provider: &tempulse_tempo::provider::TempoProvider,
     pool: &sqlx::PgPool,
@@ -102,7 +121,7 @@ async fn discover_tokens(
 
     // Scan from genesis (or start_block) to chain head for factory events
     let mut from = settings.start_block;
-    let batch = 10_000u64; // Large batches for historical scan
+    let batch = 10_000u64;
 
     while from <= chain_head {
         let to = std::cmp::min(from + batch - 1, chain_head);
@@ -125,14 +144,11 @@ async fn discover_tokens(
                     "Discovered token"
                 );
 
-                // Query on-chain metadata
-                let decimals = 6i16; // TIP-20 tokens always have 6 decimals
-
                 let token = Token {
                     address: format!("{:#x}", event.token_address),
                     name: event.name,
                     symbol: event.symbol,
-                    decimals,
+                    decimals: 6, // TIP-20 tokens always have 6 decimals
                     currency: event.currency,
                     total_supply: "0".to_string(),
                     created_at_block: event.block_number as i64,
@@ -150,6 +166,17 @@ async fn discover_tokens(
 }
 
 /// Index the next batch of blocks. Returns `Ok(true)` if work was done, `Ok(false)` if caught up.
+///
+/// ## Scalability Strategy
+///
+/// Instead of loading all token addresses into memory and passing them to the RPC filter
+/// (which breaks with millions of tokens), this function:
+///
+/// 1. **Filters by event signature only** — queries Transfer events across ALL addresses.
+/// 2. **Validates via TIP-20 prefix** — checks `is_tip20_address()` on each log (O(1), zero memory).
+/// 3. **Lazily registers unknown tokens** — if a log has the TIP-20 prefix but the token isn't
+///    in the DB yet, it inserts a placeholder and continues. This handles tokens created outside
+///    the Factory or discovered mid-batch.
 async fn index_next_batch(
     provider: &tempulse_tempo::provider::TempoProvider,
     pool: &sqlx::PgPool,
@@ -168,9 +195,6 @@ async fn index_next_batch(
 
     tracing::info!(from = from, to = to, head = chain_head, "Indexing batch");
 
-    // Get token addresses for filtering
-    let token_addresses = storage::repos::get_token_addresses(pool).await?;
-
     // ── Fetch Factory events (new tokens in this batch) ─────────────
     let factory_filter = Filter::new()
         .address(FACTORY_ADDRESS)
@@ -179,7 +203,6 @@ async fn index_next_batch(
         .to_block(to as u64);
 
     let factory_logs = provider.get_logs(&factory_filter).await?;
-    let mut new_token_addrs: Vec<String> = Vec::new();
 
     for log in &factory_logs {
         if let Some(event) = decoder::decode_factory_log(log) {
@@ -199,27 +222,13 @@ async fn index_next_batch(
                 created_at_tx: event.transaction_hash,
             };
             storage::repos::insert_token(pool, &token).await?;
-            new_token_addrs.push(token.address);
         }
     }
 
-    // Combine existing + newly discovered tokens
-    let all_tokens: Vec<Address> = token_addresses
-        .iter()
-        .chain(new_token_addrs.iter())
-        .filter_map(|a| a.parse().ok())
-        .collect();
-
-    if all_tokens.is_empty() {
-        // No tokens to track yet — just advance the cursor
-        *last_block = to;
-        storage::repos::set_last_indexed_block(pool, to).await?;
-        return Ok(true);
-    }
-
-    // ── Fetch Transfer events for all tracked tokens ────────────────
+    // ── Fetch Transfer events — filter by event signature only ──────
+    // No address filter needed. We validate each log's address via the
+    // TIP-20 prefix check, which is O(1) and uses zero extra memory.
     let transfer_filter = Filter::new()
-        .address(all_tokens)
         .event_signature(TIP20::Transfer::SIGNATURE_HASH)
         .from_block(from as u64)
         .to_block(to as u64);
@@ -230,13 +239,30 @@ async fn index_next_batch(
     let mut new_transfers: Vec<NewTransfer> = Vec::new();
 
     for log in &transfer_logs {
+        let log_address = log.address();
+
+        // ── Prefix check: skip non-TIP-20 contracts ─────────────────
+        if !is_tip20_address(&log_address) {
+            continue;
+        }
+
+        // ── Ensure this token is registered in the DB ───────────────
+        // Uses ON CONFLICT DO NOTHING, so this is safe to call repeatedly.
+        let token_addr_str = format!("{:#x}", log_address);
+        ensure_token_registered(pool, &token_addr_str, from).await?;
+
         if let Some(event) = decoder::decode_tip20_log(log) {
-            let (token_addr, from_addr, to_addr, amount_str, event_type, memo, block_num, tx_hash, idx) =
+            let (from_addr, to_addr, amount_str, event_type, memo, block_num, tx_hash, idx) =
                 match &event {
                     decoder::Tip20Event::Transfer {
-                        token_address, from, to, amount, block_number, transaction_hash, log_index,
+                        from,
+                        to,
+                        amount,
+                        block_number,
+                        transaction_hash,
+                        log_index,
+                        ..
                     } => (
-                        format!("{:#x}", token_address),
                         format!("{:#x}", from),
                         format!("{:#x}", to),
                         amount.to_string(),
@@ -247,9 +273,13 @@ async fn index_next_batch(
                         *log_index as i32,
                     ),
                     decoder::Tip20Event::Mint {
-                        token_address, to, amount, block_number, transaction_hash, log_index,
+                        to,
+                        amount,
+                        block_number,
+                        transaction_hash,
+                        log_index,
+                        ..
                     } => (
-                        format!("{:#x}", token_address),
                         format!("{:#x}", ZERO_ADDRESS),
                         format!("{:#x}", to),
                         amount.to_string(),
@@ -260,9 +290,13 @@ async fn index_next_batch(
                         *log_index as i32,
                     ),
                     decoder::Tip20Event::Burn {
-                        token_address, from, amount, block_number, transaction_hash, log_index,
+                        from,
+                        amount,
+                        block_number,
+                        transaction_hash,
+                        log_index,
+                        ..
                     } => (
-                        format!("{:#x}", token_address),
                         format!("{:#x}", from),
                         format!("{:#x}", ZERO_ADDRESS),
                         amount.to_string(),
@@ -273,9 +307,15 @@ async fn index_next_batch(
                         *log_index as i32,
                     ),
                     decoder::Tip20Event::TransferWithMemo {
-                        token_address, from, to, amount, memo, block_number, transaction_hash, log_index,
+                        from,
+                        to,
+                        amount,
+                        memo,
+                        block_number,
+                        transaction_hash,
+                        log_index,
+                        ..
                     } => (
-                        format!("{:#x}", token_address),
                         format!("{:#x}", from),
                         format!("{:#x}", to),
                         amount.to_string(),
@@ -288,7 +328,7 @@ async fn index_next_batch(
                 };
 
             new_transfers.push(NewTransfer {
-                token_address: token_addr.clone(),
+                token_address: token_addr_str.clone(),
                 from_address: from_addr.clone(),
                 to_address: to_addr.clone(),
                 amount: amount_str.clone(),
@@ -302,13 +342,23 @@ async fn index_next_batch(
             // Update balances
             if event_type == "transfer" || event_type == "mint" {
                 storage::repos::upsert_account_balance(
-                    pool, &to_addr, &token_addr, &amount_str, true, block_num,
+                    pool,
+                    &to_addr,
+                    &token_addr_str,
+                    &amount_str,
+                    true,
+                    block_num,
                 )
                 .await?;
             }
             if event_type == "transfer" || event_type == "burn" {
                 storage::repos::upsert_account_balance(
-                    pool, &from_addr, &token_addr, &amount_str, false, block_num,
+                    pool,
+                    &from_addr,
+                    &token_addr_str,
+                    &amount_str,
+                    false,
+                    block_num,
                 )
                 .await?;
             }
@@ -332,4 +382,28 @@ async fn index_next_batch(
     );
 
     Ok(true)
+}
+
+/// Ensure a TIP-20 token address is registered in the DB.
+///
+/// If the token was discovered via the Factory, it will already exist.
+/// Otherwise, insert a placeholder with minimal metadata (it can be enriched later).
+/// Uses ON CONFLICT DO NOTHING so it's safe to call on every log.
+async fn ensure_token_registered(
+    pool: &sqlx::PgPool,
+    token_address: &str,
+    block_number: i64,
+) -> Result<()> {
+    let token = Token {
+        address: token_address.to_string(),
+        name: String::new(),
+        symbol: String::new(),
+        decimals: 6,
+        currency: String::new(),
+        total_supply: "0".to_string(),
+        created_at_block: block_number,
+        created_at_tx: String::new(),
+    };
+    storage::repos::insert_token(pool, &token).await?;
+    Ok(())
 }
