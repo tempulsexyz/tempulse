@@ -1,0 +1,12 @@
+[package]
+name = "tempulse-tempo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tempulse-core = { path = "../core" }
+alloy = { version = "1.6.3", features = ["full"] }
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", tag = "v1.1.2" }
+eyre = "0.6"
+thiserror = "1.0"
+tracing = "0.1"
