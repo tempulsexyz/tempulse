@@ -2,12 +2,14 @@ import { StatCard } from "@/components/stat-card";
 import { TokenTable } from "@/components/token-table";
 import { ActivityFeed } from "@/components/activity-feed";
 import { VolumeChart } from "@/components/volume-chart";
+import { DominancePieChart } from "@/components/dominance-chart";
 import {
   getTokens,
   getOverview,
   getRecentActivity,
   getDailyVolume,
   getMonthlyVolume,
+  getVolume,
 } from "@/lib/api";
 import { formatCompact } from "@/lib/format";
 
@@ -123,16 +125,25 @@ function generateMockMonthly() {
   return data;
 }
 
+const MOCK_VOLUME = {
+  tokens: [
+    { token_address: "0x20c0000000000000000000000000000000000001", symbol: "USDC", total_volume: "45000000000", transfer_count: 1200 },
+    { token_address: "0x20c0000000000000000000000000000000000002", symbol: "USDT", total_volume: "28000000000", transfer_count: 800 },
+    { token_address: "0x20c0000000000000000000000000000000000003", symbol: "EURC", total_volume: "8450000000", transfer_count: 350 },
+  ],
+};
+
 async function fetchData() {
   try {
-    const [tokens, overview, activity, daily, monthly] = await Promise.all([
+    const [tokens, overview, activity, daily, monthly, volume] = await Promise.all([
       getTokens(),
       getOverview(),
       getRecentActivity(20),
       getDailyVolume(30),
       getMonthlyVolume(12),
+      getVolume(),
     ]);
-    return { tokens, overview, activity, daily, monthly, live: true };
+    return { tokens, overview, activity, daily, monthly, volume, live: true };
   } catch {
     return {
       tokens: MOCK_TOKENS,
@@ -140,16 +151,37 @@ async function fetchData() {
       activity: MOCK_TRANSFERS,
       daily: generateMockDaily(),
       monthly: generateMockMonthly(),
+      volume: MOCK_VOLUME,
       live: false,
     };
   }
 }
 
 export default async function DashboardPage() {
-  const { tokens, overview, activity, daily, monthly, live } =
+  const { tokens, overview, activity, daily, monthly, volume, live } =
     await fetchData();
 
   const totalVolume = Number(overview.total_value_transferred) / 1e6;
+
+  // Compute dominance data — top 10 by supply
+  const supplyDominance = [...tokens]
+    .sort((a, b) => Number(b.total_supply) - Number(a.total_supply))
+    .slice(0, 10)
+    .map((t) => ({
+      name: t.symbol || t.name || "Unknown",
+      value: Number(t.total_supply) / Math.pow(10, t.decimals),
+      address: t.address,
+    }));
+
+  // Top 10 by transfer volume
+  const volumeDominance = [...volume.tokens]
+    .sort((a, b) => Number(b.total_volume) - Number(a.total_volume))
+    .slice(0, 10)
+    .map((t) => ({
+      name: t.symbol || "Unknown",
+      value: Number(t.total_volume) / 1e6,
+      address: t.token_address,
+    }));
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -223,6 +255,14 @@ export default async function DashboardPage() {
       {/* Volume Charts — full width */}
       <div className="mb-8">
         <VolumeChart dailyData={daily} monthlyData={monthly} />
+      </div>
+
+      {/* Dominance Pie Charts */}
+      <div className="mb-8">
+        <DominancePieChart
+          supplyData={supplyDominance}
+          volumeData={volumeDominance}
+        />
       </div>
 
       {/* Token Table + Activity Feed */}
