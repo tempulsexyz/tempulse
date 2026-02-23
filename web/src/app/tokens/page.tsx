@@ -1,46 +1,8 @@
 import { TokenTable } from "@/components/token-table";
-import { getTokens } from "@/lib/api";
-
-const MOCK_TOKENS = [
-    {
-        address: "0x20c0000000000000000000000000000000000001",
-        name: "USD Coin",
-        symbol: "USDC",
-        decimals: 6,
-        currency: "USD",
-        total_supply: "1500000000000",
-        created_at_block: 100,
-        created_at_tx: "0x123",
-    },
-    {
-        address: "0x20c0000000000000000000000000000000000002",
-        name: "Tether USD",
-        symbol: "USDT",
-        decimals: 6,
-        currency: "USD",
-        total_supply: "800000000000",
-        created_at_block: 200,
-        created_at_tx: "0x456",
-    },
-    {
-        address: "0x20c0000000000000000000000000000000000003",
-        name: "Euro Coin",
-        symbol: "EURC",
-        decimals: 6,
-        currency: "EUR",
-        total_supply: "350000000000",
-        created_at_block: 300,
-        created_at_tx: "0x789",
-    },
-];
+import { fetchTokens } from "@/lib/backend";
 
 export default async function TokensPage() {
-    let tokens;
-    try {
-        tokens = await getTokens();
-    } catch {
-        tokens = MOCK_TOKENS;
-    }
+    const tokens = await fetchTokens();
 
     return (
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -50,7 +12,18 @@ export default async function TokensPage() {
                     Browse all TIP-20 stablecoins indexed on Tempo
                 </p>
             </div>
-            <TokenTable tokens={tokens} />
+            {tokens ? (
+                <TokenTable tokens={tokens} />
+            ) : (
+                <div className="rounded-xl border border-negative/30 bg-negative/5 p-6 text-center">
+                    <p className="text-negative font-medium mb-1">
+                        Unable to load tokens
+                    </p>
+                    <p className="text-muted text-sm">
+                        Make sure the Tempulse API server is running and try again.
+                    </p>
+                </div>
+            )}
         </div>
     );
 }

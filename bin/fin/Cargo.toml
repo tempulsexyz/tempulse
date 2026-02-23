@@ -12,6 +12,7 @@ alloy = { version = "1.6.3", features = ["full"] }
 tempo-alloy = { git = "https://github.com/tempoxyz/tempo", tag = "v1.1.2" }
 
 eyre = "0.6"
+chrono = "0.4"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres"] }

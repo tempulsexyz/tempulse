@@ -4,18 +4,23 @@
 //! 1. Connect to Tempo RPC & PostgreSQL
 //! 2. Discover existing tokens via TIP20Factory TokenCreated events
 //! 3. Poll blocks in batches, decode Transfer/Mint/Burn events
-//! 4. Persist to DB and update account balances
+//! 4. Persist to DB atomically and update account balances
 //!
-//! Optimization: Instead of loading all tracked token addresses into memory
-//! (which fails at scale), we use the TIP-20 address prefix to identify
-//! valid tokens at O(1) cost per log, then lazily register unknown tokens via DB.
+//! Production features:
+//! - Reorg detection via parent hash comparison against indexed_blocks
+//! - Atomic writes per batch (transfers + balances + blocks + cursor in one transaction)
+//! - total_supply tracked on mint/burn
+//! - hourly_stats aggregated in real-time
 
 use alloy::{
+    consensus::BlockHeader,
+    network::primitives::HeaderResponse,
     primitives::{Address, address},
     providers::Provider,
     rpc::types::Filter,
     sol_types::SolEvent,
 };
+use chrono::{DateTime, Timelike};
 use eyre::Result;
 use tempulse_core::{Settings, telemetry};
 use tempulse_storage::{self as storage, models::*};
@@ -167,16 +172,15 @@ async fn discover_tokens(
 
 /// Index the next batch of blocks. Returns `Ok(true)` if work was done, `Ok(false)` if caught up.
 ///
-/// ## Scalability Strategy
+/// ## Production Features
 ///
-/// Instead of loading all token addresses into memory and passing them to the RPC filter
-/// (which breaks with millions of tokens), this function:
-///
-/// 1. **Filters by event signature only** — queries Transfer events across ALL addresses.
-/// 2. **Validates via TIP-20 prefix** — checks `is_tip20_address()` on each log (O(1), zero memory).
-/// 3. **Lazily registers unknown tokens** — if a log has the TIP-20 prefix but the token isn't
-///    in the DB yet, it inserts a placeholder and continues. This handles tokens created outside
-///    the Factory or discovered mid-batch.
+/// 1. **Reorg detection** — checks parent hash of the first block in the batch against
+///    `indexed_blocks`. If mismatch, walks backward to find the fork point, rolls back,
+///    and re-indexes from there.
+/// 2. **Atomic writes** — all transfers, balance updates, block records, hourly stats,
+///    and the cursor update happen inside a single database transaction.
+/// 3. **total_supply tracking** — mint/burn events increment/decrement the token's supply.
+/// 4. **hourly_stats aggregation** — real-time aggregation into the hourly_stats table.
 async fn index_next_batch(
     provider: &tempulse_tempo::provider::TempoProvider,
     pool: &sqlx::PgPool,
@@ -194,6 +198,60 @@ async fn index_next_batch(
     let to = std::cmp::min(from + settings.batch_size as i64 - 1, chain_head);
 
     tracing::info!(from = from, to = to, head = chain_head, "Indexing batch");
+
+    // ── Reorg Detection ────────────────────────────────────────────────
+    // Check if the parent hash of block `from` matches what we stored for block `from - 1`.
+    if from > 1 {
+        if let Some(stored_hash) = storage::repos::get_block_hash(pool, from - 1).await? {
+            // Fetch the actual block from the chain to compare parent hashes
+            let block = provider
+                .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(from as u64))
+                .await?
+                .ok_or_else(|| eyre::eyre!("Block {} not found on chain", from))?;
+            let parent_hash = format!("{:#x}", block.header.parent_hash());
+            if parent_hash != stored_hash {
+                tracing::warn!(
+                    block = from,
+                    expected = %stored_hash,
+                    got = %parent_hash,
+                    "Reorg detected! Rolling back…"
+                );
+
+                // Walk backward to find the fork point
+                let mut fork_block = from - 2;
+                while fork_block > 0 {
+                    if let Some(stored) = storage::repos::get_block_hash(pool, fork_block).await? {
+                        let chain_block = provider
+                            .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(
+                                fork_block as u64,
+                            ))
+                            .await?
+                            .ok_or_else(|| {
+                                eyre::eyre!(
+                                    "Block {} not found on chain during reorg detection",
+                                    fork_block
+                                )
+                            })?;
+                        let chain_hash = format!("{:#x}", chain_block.header.hash());
+                        if chain_hash == stored {
+                            break; // Found the fork point
+                        }
+                    } else {
+                        break; // No stored hash, can't go further back
+                    }
+                    fork_block -= 1;
+                }
+
+                tracing::warn!(
+                    fork_block = fork_block,
+                    "Fork point found, rolling back to block"
+                );
+                storage::repos::reorg_rollback(pool, fork_block).await?;
+                *last_block = fork_block;
+                return Ok(true); // Signal that work was done (rollback), re-index next iteration
+            }
+        }
+    }
 
     // ── Fetch Factory events (new tokens in this batch) ─────────────
     let factory_filter = Filter::new()
@@ -226,8 +284,6 @@ async fn index_next_batch(
     }
 
     // ── Fetch Transfer events — filter by event signature only ──────
-    // No address filter needed. We validate each log's address via the
-    // TIP-20 prefix check, which is O(1) and uses zero extra memory.
     let transfer_filter = Filter::new()
         .event_signature(TIP20::Transfer::SIGNATURE_HASH)
         .from_block(from as u64)
@@ -238,6 +294,28 @@ async fn index_next_batch(
 
     let mut new_transfers: Vec<NewTransfer> = Vec::new();
 
+    // Collect balance updates and stats to apply inside the transaction
+    struct BalanceUpdate {
+        address: String,
+        token_address: String,
+        amount: String,
+        is_add: bool,
+        block_number: i64,
+    }
+
+    struct StatsUpdate {
+        token_address: String,
+        event_type: String,
+        amount: String,
+        sender: String,
+        receiver: String,
+        timestamp: i64,
+    }
+
+    let mut balance_updates: Vec<BalanceUpdate> = Vec::new();
+    let mut stats_updates: Vec<StatsUpdate> = Vec::new();
+    let mut supply_updates: Vec<(String, String, bool)> = Vec::new(); // (token, amount, is_mint)
+
     for log in &transfer_logs {
         let log_address = log.address();
 
@@ -247,7 +325,6 @@ async fn index_next_batch(
         }
 
         // ── Ensure this token is registered in the DB ───────────────
-        // Uses ON CONFLICT DO NOTHING, so this is safe to call repeatedly.
         let token_addr_str = format!("{:#x}", log_address);
         ensure_token_registered(pool, &token_addr_str, from).await?;
 
@@ -339,41 +416,136 @@ async fn index_next_batch(
                 log_index: idx,
             });
 
-            // Update balances
+            // Collect balance updates
             if event_type == "transfer" || event_type == "mint" {
-                storage::repos::upsert_account_balance(
-                    pool,
-                    &to_addr,
-                    &token_addr_str,
-                    &amount_str,
-                    true,
-                    block_num,
-                )
-                .await?;
+                balance_updates.push(BalanceUpdate {
+                    address: to_addr.clone(),
+                    token_address: token_addr_str.clone(),
+                    amount: amount_str.clone(),
+                    is_add: true,
+                    block_number: block_num,
+                });
             }
             if event_type == "transfer" || event_type == "burn" {
-                storage::repos::upsert_account_balance(
-                    pool,
-                    &from_addr,
-                    &token_addr_str,
-                    &amount_str,
-                    false,
-                    block_num,
-                )
-                .await?;
+                balance_updates.push(BalanceUpdate {
+                    address: from_addr.clone(),
+                    token_address: token_addr_str.clone(),
+                    amount: amount_str.clone(),
+                    is_add: false,
+                    block_number: block_num,
+                });
             }
+
+            // Collect supply updates for mint/burn
+            if event_type == "mint" {
+                supply_updates.push((token_addr_str.clone(), amount_str.clone(), true));
+            } else if event_type == "burn" {
+                supply_updates.push((token_addr_str.clone(), amount_str.clone(), false));
+            }
+
+            // Collect hourly stats updates
+            // Use block_number as a proxy timestamp — we'll derive the hour from `created_at`
+            // which defaults to NOW() in the DB. For accuracy, use the log's block timestamp.
+            let block_timestamp = log.block_timestamp.unwrap_or(0);
+            stats_updates.push(StatsUpdate {
+                token_address: token_addr_str.clone(),
+                event_type: event_type.to_string(),
+                amount: amount_str.clone(),
+                sender: from_addr.clone(),
+                receiver: to_addr.clone(),
+                timestamp: block_timestamp as i64,
+            });
         }
     }
 
-    // Persist transfers
+    // ── Atomic write: wrap everything in a transaction ──────────────
+    let mut tx = pool.begin().await?;
+
+    // 1. Persist transfers (true batch insert)
     if !new_transfers.is_empty() {
         tracing::info!(count = new_transfers.len(), "Persisting transfers");
-        storage::repos::insert_transfers_batch(pool, &new_transfers).await?;
+        storage::repos::insert_transfers_batch(&mut *tx, &new_transfers).await?;
     }
 
-    // Update cursor
+    // 2. Apply balance updates
+    for bu in &balance_updates {
+        storage::repos::upsert_account_balance(
+            &mut *tx,
+            &bu.address,
+            &bu.token_address,
+            &bu.amount,
+            bu.is_add,
+            bu.block_number,
+        )
+        .await?;
+    }
+
+    // 3. Apply total_supply updates
+    for (token_addr, amount, is_mint) in &supply_updates {
+        storage::repos::update_total_supply_on_event(&mut *tx, token_addr, amount, *is_mint)
+            .await?;
+    }
+
+    // 4. Apply hourly stats
+    for su in &stats_updates {
+        let hour = if su.timestamp > 0 {
+            DateTime::from_timestamp(su.timestamp, 0)
+                .unwrap_or_default()
+                .naive_utc()
+                .date()
+                .and_hms_opt(
+                    DateTime::from_timestamp(su.timestamp, 0)
+                        .unwrap_or_default()
+                        .naive_utc()
+                        .time()
+                        .hour() as u32,
+                    0,
+                    0,
+                )
+                .unwrap_or_default()
+        } else {
+            // Fallback: use current time truncated to hour
+            chrono::Utc::now()
+                .naive_utc()
+                .date()
+                .and_hms_opt(chrono::Utc::now().naive_utc().time().hour() as u32, 0, 0)
+                .unwrap_or_default()
+        };
+
+        storage::repos::upsert_hourly_stats(
+            &mut *tx,
+            &su.token_address,
+            hour,
+            &su.event_type,
+            &su.amount,
+            &su.sender,
+            &su.receiver,
+        )
+        .await?;
+    }
+
+    // 5. Record indexed blocks for this batch (for reorg detection)
+    // We record the last block in the batch at minimum
+    if let Some(block) = provider
+        .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(to as u64))
+        .await?
+    {
+        let indexed_block = IndexedBlock {
+            block_number: to,
+            block_hash: format!("{:#x}", block.header.hash()),
+            parent_hash: format!("{:#x}", block.header.parent_hash()),
+            timestamp: block.header.timestamp() as i64,
+        };
+        storage::repos::insert_block(&mut *tx, &indexed_block).await?;
+    }
+
+    // 6. Update cursor
+    storage::repos::set_last_indexed_block(&mut *tx, to).await?;
+
+    // ── Commit the transaction ──────────────────────────────────────
+    tx.commit().await?;
+
     *last_block = to;
-    storage::repos::set_last_indexed_block(pool, to).await?;
 
     tracing::info!(
         block = to,

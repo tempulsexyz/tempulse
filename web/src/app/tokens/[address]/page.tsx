@@ -2,77 +2,40 @@ import { HoldersTable } from "@/components/holders-table";
 import { ActivityFeed } from "@/components/activity-feed";
 import { StatCard } from "@/components/stat-card";
 import { TokenVolumeChart } from "@/components/token-volume-chart";
-import {
-    getToken,
-    getTokenHolders,
-    getTokenTransfers,
-    getTokenDailyVolume,
-} from "@/lib/api";
+import { fetchTokenDetailData } from "@/lib/backend";
 import { formatTokenAmount, truncateAddress } from "@/lib/format";
 
 interface TokenDetailPageProps {
     params: Promise<{ address: string }>;
 }
 
-const MOCK_TOKEN = {
-    address: "0x20c0000000000000000000000000000000000001",
-    name: "USD Coin",
-    symbol: "USDC",
-    decimals: 6,
-    currency: "USD",
-    total_supply: "1500000000000",
-    created_at_block: 100,
-    created_at_tx: "0x123abc",
-};
-
-const MOCK_HOLDERS = [
-    { address: "0xd8da6bf26964af9d7eed9e03e53415d37aa96045", token_address: "0x20c0000000000000000000000000000000000001", balance: "500000000000", updated_at_block: 1000 },
-    { address: "0x742d35cc6634c0532925a3b844bc9e7595f2bd38", token_address: "0x20c0000000000000000000000000000000000001", balance: "350000000000", updated_at_block: 999 },
-    { address: "0xabc4567890abcdef1234567890abcdef12345678", token_address: "0x20c0000000000000000000000000000000000001", balance: "200000000000", updated_at_block: 998 },
-    { address: "0xdef4567890abcdef1234567890abcdef12345678", token_address: "0x20c0000000000000000000000000000000000001", balance: "150000000000", updated_at_block: 997 },
-    { address: "0x1234567890abcdef1234567890abcdef12345678", token_address: "0x20c0000000000000000000000000000000000001", balance: "100000000000", updated_at_block: 996 },
-];
-
-const MOCK_TRANSFERS = [
-    { id: 1, token_address: "0x20c0000000000000000000000000000000000001", from_address: "0x0000000000000000000000000000000000000000", to_address: "0xd8da6bf26964af9d7eed9e03e53415d37aa96045", amount: "5000000000", memo: null, event_type: "mint", transaction_hash: "0xabc123", block_number: 1000500, log_index: 0, created_at: new Date().toISOString() },
-    { id: 2, token_address: "0x20c0000000000000000000000000000000000001", from_address: "0xd8da6bf26964af9d7eed9e03e53415d37aa96045", to_address: "0x742d35cc6634c0532925a3b844bc9e7595f2bd38", amount: "1250000000", memo: null, event_type: "transfer", transaction_hash: "0xdef456", block_number: 1000498, log_index: 1, created_at: new Date().toISOString() },
-];
-
-// Generate mock daily volume for token detail
-function generateMockTokenDaily() {
-    const data = [];
-    const now = new Date();
-    for (let i = 29; i >= 0; i--) {
-        const d = new Date(now);
-        d.setDate(d.getDate() - i);
-        const base = 800_000_000 + Math.floor(Math.random() * 400_000_000);
-        const trend = Math.sin(i / 4) * 200_000_000;
-        data.push({
-            date: d.toISOString().split("T")[0],
-            volume: Math.floor(base + trend).toString(),
-            transfer_count: 5 + Math.floor(Math.random() * 15),
-        });
-    }
-    return data;
-}
-
 export default async function TokenDetailPage({ params }: TokenDetailPageProps) {
     const { address } = await params;
+    const data = await fetchTokenDetailData(address);
 
-    let token, holders, transfers, dailyVolume;
-    try {
-        [token, holders, transfers, dailyVolume] = await Promise.all([
-            getToken(address),
-            getTokenHolders(address, 20),
-            getTokenTransfers(address, 20),
-            getTokenDailyVolume(address, 30),
-        ]);
-    } catch {
-        token = MOCK_TOKEN;
-        holders = MOCK_HOLDERS;
-        transfers = MOCK_TRANSFERS;
-        dailyVolume = generateMockTokenDaily();
+    if (!data) {
+        return (
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                <div className="flex items-center gap-2 text-sm text-muted mb-3">
+                    <a href="/" className="hover:text-foreground transition-colors">Dashboard</a>
+                    <span>/</span>
+                    <a href="/tokens" className="hover:text-foreground transition-colors">Tokens</a>
+                    <span>/</span>
+                    <span className="text-foreground font-mono">{truncateAddress(address)}</span>
+                </div>
+                <div className="rounded-xl border border-negative/30 bg-negative/5 p-6 text-center">
+                    <p className="text-negative font-medium mb-1">
+                        Unable to load token details
+                    </p>
+                    <p className="text-muted text-sm">
+                        Token not found or the API server is unavailable.
+                    </p>
+                </div>
+            </div>
+        );
     }
+
+    const { token, holders, transfers, dailyVolume } = data;
 
     // Calculate payment velocity: volume / supply ratio
     const totalSupplyNum = Number(token.total_supply) || 1;
