@@ -1,4 +1,5 @@
 # Tempulse Production Stack
+# Images are built by GitHub Actions and pushed to ghcr.io.
 # Usage: docker compose -f docker-compose.prod.yml up -d
 
 services:
@@ -23,7 +24,7 @@ services:
 
   # ─── Indexer (fin) ───────────────────────────────────────────
   indexer:
-    build: .
+    image: ghcr.io/tempulsexyz/tempulse:latest
     container_name: tempulse-indexer
     restart: unless-stopped
     command: ["tempulse-fin"]
@@ -41,7 +42,7 @@ services:
 
   # ─── API Server ──────────────────────────────────────────────
   api:
-    build: .
+    image: ghcr.io/tempulsexyz/tempulse:latest
     container_name: tempulse-api
     restart: unless-stopped
     command: ["tempulse-api"]
@@ -57,27 +58,9 @@ services:
     networks:
       - tempulse
 
-  # ─── Caddy Reverse Proxy (HTTPS) ────────────────────────────
-  # Uncomment this section when you have a domain name.
-  # caddy:
-  #   image: caddy:2-alpine
-  #   container_name: tempulse-caddy
-  #   restart: unless-stopped
-  #   ports:
-  #     - "80:80"
-  #     - "443:443"
-  #   volumes:
-  #     - ./Caddyfile:/etc/caddy/Caddyfile
-  #     - caddy_data:/data
-  #     - caddy_config:/config
-  #   networks:
-  #     - tempulse
-
 networks:
   tempulse:
     driver: bridge
 
 volumes:
   pgdata:
-  # caddy_data:
-  # caddy_config:
