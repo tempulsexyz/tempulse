@@ -9,7 +9,7 @@ import {
   type TimeSeriesEntry,
 } from "./api";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
+const API_BASE = process.env.API_URL || "http://localhost:3001";
 
 interface ApiResponse<T> {
   success: boolean;
@@ -18,7 +18,7 @@ interface ApiResponse<T> {
 
 async function apiFetch<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
-    next: { revalidate: 10 },
+    cache: "no-store",
   });
   if (!res.ok) {
     throw new Error(`API error: ${res.status} ${res.statusText}`);

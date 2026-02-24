@@ -125,11 +125,13 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// GET /api/v1/tokens — list all tracked stablecoins.
+/// GET /api/v1/tokens — list tracked stablecoins (paginated).
 async fn list_tokens(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<String>>)> {
-    let tokens = storage::repos::get_all_tokens(&state.pool)
+    let limit = params.limit.unwrap_or(100);
+    let tokens = storage::repos::get_all_tokens(&state.pool, limit)
         .await
         .map_err(|e| json_err(&e.to_string()).into())?;
     Ok(json_ok(tokens))

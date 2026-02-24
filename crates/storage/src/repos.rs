@@ -28,8 +28,9 @@ pub async fn insert_token(pool: &PgPool, token: &Token) -> Result<(), sqlx::Erro
 }
 
 /// Get all tracked tokens.
-pub async fn get_all_tokens(pool: &PgPool) -> Result<Vec<Token>, sqlx::Error> {
-    sqlx::query_as::<_, Token>("SELECT * FROM tokens ORDER BY symbol")
+pub async fn get_all_tokens(pool: &PgPool, limit: i64) -> Result<Vec<Token>, sqlx::Error> {
+    sqlx::query_as::<_, Token>("SELECT * FROM tokens ORDER BY symbol LIMIT $1")
+        .bind(limit)
         .fetch_all(pool)
         .await
 }

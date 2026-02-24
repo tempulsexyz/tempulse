@@ -6,6 +6,8 @@ import { DominancePieChart } from "@/components/dominance-chart";
 import { fetchDashboardData } from "@/lib/backend";
 import { formatCompact } from "@/lib/format";
 
+export const dynamic = "force-dynamic";
+
 export default async function DashboardPage() {
   const data = await fetchDashboardData();
 

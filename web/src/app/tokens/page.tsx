@@ -1,6 +1,8 @@
 import { TokenTable } from "@/components/token-table";
 import { fetchTokens } from "@/lib/backend";
 
+export const dynamic = "force-dynamic";
+
 export default async function TokensPage() {
     const tokens = await fetchTokens();
 
